@@ -33,15 +33,16 @@ _addon.author = 'Deridjian'
 _addon.version = 2.0
 _addon.commands = {'sheolhelper', 'sheol', 'shh'}
 
-config = require('config')
-defaults = require('defaults')
-images = require('images')
-packets = require('packets')
-resources = require('resources')
-strings = require('strings')
-texts = require('texts')
-resistances = require('resistances')
-types = require('types')
+-- Localized requires to prevent global namespace pollution
+local config = require('config')
+local defaults = require('defaults')
+local images = require('images')
+local packets = require('packets')
+local resources = require('resources')
+local strings = require('strings')
+local texts = require('texts')
+local resistances = require('resistances')
+local types = require('types')
 require('logger')
 
 local settings = config.load(defaults)
@@ -64,6 +65,10 @@ local last_target = ''
 local segments = 0
 local player_total = 0
 local sheolzone
+
+-- Pre-declare our event monitor variables locally
+local res_monitor, seg_monitor, floor_monitor, rabao_monitor, sheolzone_fetcher
+
 local translocators = {{1,3,5}, {1,3,6}, {1,2}}
 local instances = {{1019,1020}, {1021,1022}, {1023,1024}}
 local map = images.new(settings.map, settings)
@@ -74,6 +79,11 @@ function center_disclaimer()
 end
 
 function set_up_entry()
+    -- Unregister existing events to prevent duplicates if manual command is used multiple times
+    if res_monitor then windower.unregister_event(res_monitor); res_monitor = nil end
+    if seg_monitor then windower.unregister_event(seg_monitor); seg_monitor = nil end
+    if floor_monitor then windower.unregister_event(floor_monitor); floor_monitor = nil end
+
     -- reset segments; in case of two consecutive runs
     segments = 0
     seg_box.segments = segments
@@ -126,33 +136,101 @@ end
 
 function build_res_strings(target, target_index)
     local name = target.name
-    local family = (name:find('Nostos') or name:find('Agon')) and name:gsub('^%a+%s', '') or name
-    local res_string = ''
-    local ele_string = ''
-    local max_ele = table.max(resistances[family])
-    local type
+    local is_agon = name:find('Agon')
+    local job = (name:find('Nostos') or is_agon) and name:gsub('^%a+%s', '') or name
+    
+    -- SAFETY CHECK: Ensure we know what zone we are in and that the zone data exists
+    if not sheolzone or not resistances[sheolzone] then return end
+    
+    local zone_res = resistances[sheolzone]
 
+    local type
     -- loop over mobs, find current, and get its family key
     for k, v in pairs(types) do
-        if table.find(v, family) then
+        if table.find(v, job) then
             type = k
             break
         end
     end
 
+    -- RESOLVE CLERIC CONFLICT: Quadav (Sheol A) vs Mamool (Sheol C)
+    if job == 'Cleric' then
+        if sheolzone == 1 then type = 'Quadav'
+        elseif sheolzone == 3 then type = 'Mamool'
+        end
+    end
+
+    -- SAFETY CHECK: Ensure we found a type for this mob to prevent nil crashes
+    if not type then return end
+
+    -- FIX: Job Lookup Trap
+    -- Nostos uses job ('Crab') in resistances. Agon uses type ('Tonberry').
+    local lookup_key = is_agon and type or job
+
+    -- SAFETY CHECK: Ensure we actually have data for this family in this specific zone
+    if not zone_res[lookup_key] then return end
+
+    local res_string = ''
+    local ele_string = ''
+    
+    -- Dynamically calculate resistance penalties based on Zone and Mob Type
+    local phys_penalty = 0
+    local magic_penalty = 0
+    local secondary_phys_penalty = 0
+    local secondary_phys_type = ''
+
+    if is_agon then
+        if sheolzone == 2 then
+            phys_penalty = 0.375
+        elseif sheolzone == 3 then
+            phys_penalty = 0.625
+            magic_penalty = 0.125
+            secondary_phys_penalty = 0.125
+            if type == 'Mamool' then secondary_phys_type = 'Slashing' end
+            if type == 'Troll' then secondary_phys_type = 'Piercing' end
+        end
+    else
+        if sheolzone == 2 then
+            phys_penalty = 0.25
+            magic_penalty = 0.25
+        elseif sheolzone == 3 then
+            phys_penalty = 0.50
+            magic_penalty = 0.50
+        end
+    end
+
+    -- Calculate the true max magic element dynamically, factoring in Odyssey magic resistance
+    local max_ele = -999
+    for i = 5, 12 do
+        local base_val = zone_res[lookup_key][i]
+        local penalty = types[type][1] == 'Magic' and magic_penalty or 0
+        if is_agon and sheolzone == 3 then penalty = magic_penalty end
+        local modified_val = base_val - penalty
+        if modified_val > max_ele then max_ele = modified_val end
+    end
+
     -- loop over weapon types
     for i = 1, 3 do
-        local weapon = resistances['Legend'][i]
-        local resistance = weapon == types[type][1] and resistances[family][i] - 0.5 or resistances[family][i]
+        local weapon = zone_res['Legend'][i]
+        local resistance = zone_res[lookup_key][i]
+        
+        if weapon == types[type][1] then
+            resistance = resistance - phys_penalty
+        elseif weapon == secondary_phys_type then
+            resistance = resistance - secondary_phys_penalty
+        end
+        
         local color = resistance > 1 and [[\cs(0, 255, 0)]] or resistance < 1 and [[\cs(255, 0, 0)]] or [[\cs(255, 255, 255)]]
-
         res_string = res_string..'\n'..color..string.rpad(weapon..':', ' ', 10)..string.lpad(tostring(resistance*100), ' ', 3)..[[%\cr]]
     end
 
     -- loop over elements
     for i = 5, 12 do
-        local ele = string.slice(resistances['Legend'][i], 1, 2)
-        local val = types[type][1] == 'Magic' and resistances[family][i] - 0.5 or resistances[family][i]
+        local ele = string.slice(zone_res['Legend'][i], 1, 2)
+        local base_val = zone_res[lookup_key][i]
+        local penalty = types[type][1] == 'Magic' and magic_penalty or 0
+        if is_agon and sheolzone == 3 then penalty = magic_penalty end
+        local val = base_val - penalty
         local color = val == max_ele and [[\cs(0, 255, 0)]] or val < 1 and [[\cs(255, 0, 0)]] or [[\cs(255, 255, 255)]]
 
         if i == 9 then
@@ -169,7 +247,7 @@ function build_res_strings(target, target_index)
     res_box.resistances = res_string..'\n\n'..ele_string
 
     if settings.res_box.joke then
-        local color = resistances[family][4] == 0.000 and [[\cs(255, 0, 0)]] or [[\cs(0, 255, 0)]]
+        local color = zone_res[lookup_key][4] == 0.000 and [[\cs(255, 0, 0)]] or [[\cs(0, 255, 0)]]
         res_box.crueljoke = color..'\n\nCruel Joke'..[[\cr]]
     end
 end
@@ -181,8 +259,9 @@ function print_resistances(target_index)
     
         -- only redraw if the mob is different from last one
         if
-            target_index > 0 and not
-            is_halo and
+            target_index > 0 and
+            target and 
+            not is_halo and
             target.name ~= last_target and
             target.spawn_type == 16 and
             target.valid_target
@@ -202,14 +281,14 @@ end
 
 function count_segments(id, data, modified, injected, blocked)
     -- resting message is used for segment count besides other things like odyssey queue messages
-    if sheolzone > 0 and sheolzone < 4 and id == 0x02A and not injected then
+    if sheolzone and sheolzone > 0 and sheolzone < 4 and id == 0x02A and not injected then
         local packet = packets.parse('incoming', data)
         -- message ID is subject to change with future retail updates;
         -- changed: April 2022 (40001>40002), September 2022 (40002>40005)
         -- luckily the players total is also passed here
         -- this makes it possible to prevent duplicates and account for packet loss at the same time
         -- we only count segments that also show a difference in total to exclude duplicated chunks
-        if packet['Message ID'] == 40005 and player_total ~= packet['Param 2'] then
+        if packet['Message ID'] == 40013 and player_total ~= packet['Param 2'] then
             -- make an exception if the total does not match the current count, i.e. one ore more former packets got lost
             if packet['Param 2'] - packet['Param 1'] ~= player_total and player_total ~= 0 then
                 segments = segments + packet['Param 2'] - player_total
@@ -227,8 +306,14 @@ function watch_floor_change(id, data, modified, injected, blocked)
         local packet = packets.parse('outgoing', data)
         local new_floor
         
+        -- Safely query the target ID to check its name instead of using an expensive tostring() on the packet
+        local target = windower.ffxi.get_mob_by_id(packet['Target'])
+        if not target then return end
+
+        local target_name = target.name or ''
+        
         -- conflux menu was used
-        if tostring(packet):contains('Conflux') then
+        if target_name:contains('Conflux') then
             -- even numbered confluxes always teleport one floor down where that floor equals the confluxes number divided by two
             if packet['Option Index'] % 2 == 0 then
                 new_floor = packet['Option Index'] / 2 == 0 and 1 or packet['Option Index'] / 2
@@ -249,12 +334,12 @@ function watch_floor_change(id, data, modified, injected, blocked)
             end
 
         -- translocator menu was used
-        elseif tostring(packet):contains('Translocator') then
+        elseif target_name:contains('Translocator') then
             -- 'option index' is the translocator that was warped to, corresponding floors are known values
-            new_floor = translocators[sheolzone][packet['Option Index']]
+            new_floor = translocators[sheolzone] and translocators[sheolzone][packet['Option Index']]
         end
 
-        if new_floor then
+        if new_floor and sheolzone then
             map:path(windower.addon_path..'maps/'..sheolzone..'-'..new_floor..'.png')
         end
     end
@@ -265,11 +350,12 @@ function set_sheolzone_inside(id, data, modified, injected, blocked)
     if id == 0x00E and not injected then
 
         local packet = packets.parse('incoming', data)
-        local sender = windower.ffxi.get_mob_by_index(packet['Index']) and windower.ffxi.get_mob_by_index(packet['Index']).spawn_type or nil
+        local mob = windower.ffxi.get_mob_by_index(packet['Index'])
+        local sender = mob and mob.spawn_type or nil
 
-        if sender and sender == 16 or sender == 2 then
+        if sender == 16 or sender == 2 then
             -- grab unique instance bit
-            local instance = bit.band(bit.rshift(windower.ffxi.get_mob_by_index(packet['Index']).id, 12), 0xFFF)
+            local instance = bit.band(bit.rshift(mob.id, 12), 0xFFF)
             -- find out if current instance is Sheol A, B or C
             for k, v in pairs(instances) do
                 if table.find(v, instance) then
@@ -281,7 +367,10 @@ function set_sheolzone_inside(id, data, modified, injected, blocked)
             end
 
             -- stop all of this from firing over and over again since we now know what instance we are in
-            windower.unregister_event(sheolzone_fetcher)
+            if sheolzone_fetcher then
+                windower.unregister_event(sheolzone_fetcher)
+                sheolzone_fetcher = nil
+            end
         end
     end
 end
@@ -316,13 +405,16 @@ windower.register_event('zone change', function(new_id, old_id)
 
     -- leaving Sheol A, B or C
     if sheolzone and (old_id == 298 or old_id == 279) then
-        windower.unregister_event(seg_monitor, res_monitor, floor_monitor)
+        if seg_monitor then windower.unregister_event(seg_monitor); seg_monitor = nil end
+        if res_monitor then windower.unregister_event(res_monitor); res_monitor = nil end
+        if floor_monitor then windower.unregister_event(floor_monitor); floor_monitor = nil end
         clean_up_exit(new_id)
     end
     
     -- leaving Rabao to anywhere else
     if rabao_monitor and old_id == 247 then
         windower.unregister_event(rabao_monitor)
+        rabao_monitor = nil
         if not sheolzone and seg_box:visible() then
             seg_box:hide()
         end
@@ -330,7 +422,7 @@ windower.register_event('zone change', function(new_id, old_id)
 end)
 
 windower.register_event('addon command', function(command, ...)
-    cmd = command and command:lower()
+    local cmd = command and command:lower()
     local arg = {...}
 
     if cmd == 'understood' then
@@ -441,8 +533,51 @@ windower.register_event('addon command', function(command, ...)
             end
         end
 
+    elseif cmd == 'zone' then
+        local current_zone = windower.ffxi.get_info().zone
+        if current_zone ~= 298 and current_zone ~= 279 then
+            error("You must be inside an Odyssey instance to manually set the zone.")
+            return
+        end
+
+        if not arg[1] then
+            error("Please specify a zone: a, b, or c.")
+            return
+        end
+        
+        local target_zone = arg[1]:lower()
+        if target_zone == 'a' then
+            sheolzone = 1
+        elseif target_zone == 'b' then
+            sheolzone = 2
+        elseif target_zone == 'c' then
+            sheolzone = 3
+        else
+            error("Invalid zone. Please use 'a', 'b', or 'c'.")
+            return
+        end
+
+        notice("Sheol zone manually set to: " .. target_zone:upper())
+        map:path(windower.addon_path..'maps/'..sheolzone..'-1.png')
+        set_up_entry()
+        
+        -- Turn off the automatic fetcher if it's currently running
+        if sheolzone_fetcher then
+            windower.unregister_event(sheolzone_fetcher)
+            sheolzone_fetcher = nil
+        end
+
     else
+        -- Creative standby message when outside of Odyssey
+        if not sheolzone then
+            windower.add_to_chat(167, "--> [SheolHelper is on Standby] <--")
+            windower.add_to_chat(207, "Tracking and mob analysis are currently hibernating.")
+            windower.add_to_chat(207, "Systems will automatically engage upon entering Odyssey.")
+            windower.add_to_chat(207, " ") -- Blank line for spacing
+        end
+
         windower.add_to_chat(200, "SheolHelper Commands:")
+        windower.add_to_chat(207, "//shh zone [a/b/c] : Manually sets the current Sheol zone")
         windower.add_to_chat(207, "//shh toggle [segments/resistances/joke] : Shows/hides either info")
         windower.add_to_chat(207, "//shh bg [segments/resistances/all] [0-255] : Sets the alpha channel for backgrounds")
         windower.add_to_chat(207, "//shh conserve : Toggles segments being shown in Rabao after a run")
