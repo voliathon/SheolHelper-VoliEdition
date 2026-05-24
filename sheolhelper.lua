@@ -288,7 +288,7 @@ function count_segments(id, data, modified, injected, blocked)
         -- luckily the players total is also passed here
         -- this makes it possible to prevent duplicates and account for packet loss at the same time
         -- we only count segments that also show a difference in total to exclude duplicated chunks
-        if packet['Message ID'] == 40013 and player_total ~= packet['Param 2'] then
+        if packet['Message ID'] == 40015 and player_total ~= packet['Param 2'] then
             -- make an exception if the total does not match the current count, i.e. one ore more former packets got lost
             if packet['Param 2'] - packet['Param 1'] ~= player_total and player_total ~= 0 then
                 segments = segments + packet['Param 2'] - player_total
